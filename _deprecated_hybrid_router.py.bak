@@ -1,0 +1,509 @@
+"""
+Buddy OS v8 — Hybrid LLM Router
+===============================
+A drop-in replacement for the OpenAI client that routes every request across
+LOCAL and CLOUD providers:
+
+    local   -> Ollama (free, private, slower)
+    cloud   -> NVIDIA NIM / Groq / Gemini / OpenAI / Anthropic / OpenRouter
+
+Design goals:
+  1. Interface-compatible: exposes `.chat.completions.create(model=..., messages=...)`
+     returning an object with `.choices[0].message.content` — so MissionControl,
+     every Worker, and the server can use it without any changes.
+  2. Complexity-aware routing: simple tasks stay on free local models; hard
+     tasks (architecture, decomposition, long code, debugging) auto-escalate
+     to the best available cloud provider.
+  3. Resilient: per-provider circuit breakers, automatic fallback chain,
+     timeouts, retry with escalation.
+  4. Cost-aware: estimates tokens + cost per call, persists usage to
+     data/router_usage.json, provides .usage_report().
+
+Provider keys are read from environment variables (never hardcode them):
+    NVIDIA_API_KEY, GROQ_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY,
+    ANTHROPIC_API_KEY, OPENROUTER_API_KEY,
+    OLLAMA_HOST (default http://localhost:11434)
+
+v8.6 — the ULTRA BRAIN: NVIDIA NIM (nemotron-3-ultra-550b-a55b) sits at the
+front of the cloud chain. It is a reasoning MoE model, so its chain-of-thought
+arrives either in a separate `reasoning_content` field or wrapped in <think>
+tags; `_extract_content` strips/handles both so callers only ever see the
+final answer.
+"""
+
+import os
+import json
+import re
+import time
+import threading
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+try:
+    from openai import OpenAI
+except ImportError:  # pragma: no cover
+    OpenAI = None
+
+try:                                    # keys live in .env, not the shell
+    from .env_loader import load_env
+except ImportError:                     # direct `python core/hybrid_router.py`
+    from env_loader import load_env     # type: ignore
+load_env()
+
+
+# --------------------------------------------------------------------------
+# Provider registry — all providers are OpenAI-compatible endpoints.
+# cost = USD per 1M tokens (input, output). Set to 0.0 when unknown/free.
+# power = raw brain rank 0-100, used by tier='best' (cost is NOT capability:
+#         NVIDIA's free-credit endpoint would otherwise sort last).
+# Order matters: within a tier, providers are tried top-to-bottom.
+# --------------------------------------------------------------------------
+PROVIDERS: Dict[str, Dict[str, Any]] = {
+    'ollama': {
+        'base_url': os.getenv('OLLAMA_HOST', 'http://localhost:11434') + '/v1',
+        'api_key': 'ollama',
+        'env': None,                       # always available (if Ollama runs)
+        'model': 'qwen3-coder:30b',        # default local model
+        'fast_model': 'qwen3-coder:30b',
+        'cost_in': 0.0, 'cost_out': 0.0, 'power': 45,
+        'tier': 'local', 'timeout': 300,
+    },
+    # ---- THE ULTRA BRAIN -------------------------------------------------
+    # 550B MoE (55B active), reasoning-capable, built for long-running agents.
+    # First cloud stop: strongest brain Buddy has, and free credits on
+    # build.nvidia.com. Reasoning burns tokens before the answer → big
+    # timeout and generous max_tokens are deliberate.
+    'nvidia': {
+        'base_url': os.getenv('NVIDIA_BASE_URL',
+                              'https://integrate.api.nvidia.com/v1'),
+        'env': 'NVIDIA_API_KEY',
+        'model': os.getenv('NVIDIA_MODEL',
+                           'nvidia/nemotron-3-ultra-550b-a55b'),
+        'fast_model': os.getenv('NVIDIA_FAST_MODEL',
+                                'nvidia/nemotron-3.5-lightning-30b-a3b'),
+        'cost_in': 0.0, 'cost_out': 0.0, 'power': 95,
+        'tier': 'cloud', 'timeout': int(os.getenv('NVIDIA_TIMEOUT', '600')),
+        'reasoning': True,        # thinks before answering → needs headroom
+    },
+    'groq': {
+        'base_url': 'https://api.groq.com/openai/v1',
+        'env': 'GROQ_API_KEY',
+        'model': 'llama-3.3-70b-versatile',
+        'fast_model': 'llama-3.3-70b-versatile',
+        'cost_in': 0.59, 'cost_out': 0.79, 'power': 70,
+        'tier': 'cloud', 'timeout': 120,
+    },
+    'gemini': {
+        'base_url': 'https://generativelanguage.googleapis.com/v1beta/openai/',
+        'env': 'GEMINI_API_KEY',
+        'model': 'gemini-2.5-flash',
+        'fast_model': 'gemini-2.5-flash',
+        'cost_in': 0.30, 'cost_out': 2.50, 'power': 75,
+        'tier': 'cloud', 'timeout': 120,
+    },
+    'openai': {
+        'base_url': 'https://api.openai.com/v1',
+        'env': 'OPENAI_API_KEY',
+        'model': 'gpt-4o',
+        'fast_model': 'gpt-4o-mini',
+        'cost_in': 2.50, 'cost_out': 10.00, 'power': 85,
+        'tier': 'cloud', 'timeout': 180,
+    },
+    'anthropic': {
+        # Anthropic exposes an OpenAI-compatible endpoint at /v1
+        'base_url': 'https://api.anthropic.com/v1',
+        'env': 'ANTHROPIC_API_KEY',
+        'model': 'claude-sonnet-4-20250514',
+        'fast_model': 'claude-sonnet-4-20250514',
+        'cost_in': 3.00, 'cost_out': 15.00, 'power': 90,
+        'tier': 'cloud', 'timeout': 180,
+    },
+    'openrouter': {
+        'base_url': 'https://openrouter.ai/api/v1',
+        'env': 'OPENROUTER_API_KEY',
+        'model': 'openai/gpt-4o-mini',
+        'fast_model': 'openai/gpt-4o-mini',
+        'cost_in': 0.15, 'cost_out': 0.60, 'power': 60,
+        'tier': 'cloud', 'timeout': 180,
+    },
+}
+
+# Keywords that signal a task is too important/complex for a small local model.
+COMPLEX_MARKERS = [
+    'architect', 'refactor', 'decompose', 'mission', 'strategy', 'revenue',
+    'monetize', 'debug this traceback', 'optimize', 'security', 'migrate',
+    'full application', 'production-ready', 'complex', 'multi-step',
+    'business plan', 'analyze this codebase', 'integration',
+]
+
+CIRCUIT_THRESHOLD = 3          # consecutive failures before a provider is benched
+CIRCUIT_COOLDOWN_SEC = 300     # ...for 5 minutes
+
+
+class _Message:
+    def __init__(self, content: str):
+        self.content = content
+        self.role = 'assistant'
+
+
+class _Choice:
+    def __init__(self, content: str):
+        self.message = _Message(content)
+
+
+class ChatResponse:
+    """Mimics openai.ChatCompletion response shape used across Buddy OS."""
+
+    def __init__(self, content: str, model: str, provider: str,
+                 prompt_tokens: int = 0, completion_tokens: int = 0,
+                 cost_usd: float = 0.0):
+        self.choices = [_Choice(content)]
+        self.model = model
+        self.provider = provider
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.cost_usd = cost_usd
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate (~4 chars/token). Good enough for cost math."""
+    return max(1, len(text or '') // 4)
+
+
+_THINK_RE = re.compile(r'<think>.*?</think>', re.DOTALL | re.IGNORECASE)
+
+
+def _extract_content(resp: Any) -> str:
+    """
+    Pull the FINAL answer out of a completion, whatever shape it arrives in.
+
+    Reasoning models (Nemotron 3 Ultra, qwen3, deepseek-r1 ...) either:
+      a) return the chain-of-thought in a separate `reasoning_content` field
+         and leave `content` clean  → use content as-is;
+      b) wrap the thinking in <think>...</think> inside `content`
+         → strip it; or
+      c) spend the whole budget thinking and leave `content` empty
+         → fall back to reasoning_content so the caller gets *something*
+           instead of ''.
+    """
+    try:
+        msg = resp.choices[0].message
+    except Exception:
+        return ''
+    content = getattr(msg, 'content', None) or ''
+    if '<think>' in content.lower():
+        content = _THINK_RE.sub('', content).strip()
+        # unterminated think block (truncated output) — keep what's after it
+        if '<think>' in content.lower():
+            content = content.lower().split('<think>')[0].strip() or content
+    if not content.strip():
+        reasoning = getattr(msg, 'reasoning_content', None)
+        if reasoning is None:
+            extra = getattr(msg, 'model_extra', None) or {}
+            reasoning = extra.get('reasoning_content') or extra.get('reasoning')
+        content = (reasoning or '').strip()
+    return content
+
+
+def score_complexity(messages: List[Dict[str, str]], max_tokens: int) -> int:
+    """Score 0-100: how much does this call deserve a bigger brain?"""
+    text = ' '.join(str(m.get('content', '')) for m in messages).lower()
+    score = 0
+
+    # Long context needs a strong model (local 30B chokes past ~8k chars)
+    score += min(40, len(text) // 500)
+    if max_tokens >= 4000:
+        score += 10
+
+    for marker in COMPLEX_MARKERS:
+        if marker in text:
+            score += 12
+
+    # Lots of code in the prompt → harder generation task
+    if '```' in text:
+        score += 10
+    if 'traceback' in text or 'exception' in text:
+        score += 8
+
+    return min(100, score)
+
+
+class _Completions:
+    """router.chat.completions — the actual routing engine."""
+
+    def __init__(self, router: 'HybridRouter'):
+        self._router = router
+
+    def create(self, model: Optional[str] = None, messages: List[Dict] = None,
+               temperature: float = 0.2, max_tokens: int = 4000,
+               tier: Optional[str] = None, **kwargs) -> ChatResponse:
+        """
+        `tier` optional override: 'local' | 'cloud' | 'best'.
+        Everything else matches the OpenAI signature callers already use.
+        """
+        return self._router.complete(
+            model=model, messages=messages or [], temperature=temperature,
+            max_tokens=max_tokens, tier=tier,
+        )
+
+
+class _Chat:
+    def __init__(self, router: 'HybridRouter'):
+        self.completions = _Completions(router)
+
+
+class HybridRouter:
+    """
+    Usage:
+        router = HybridRouter()
+        resp = router.chat.completions.create(
+            model='qwen3-coder:30b',       # treated as a hint, not a command
+            messages=[{'role': 'user', 'content': '...'}],
+        )
+        print(resp.choices[0].message.content)
+    """
+
+    def __init__(self, usage_path: str = 'data/router_usage.json',
+                 prefer_cloud_above: int = 55):
+        self.chat = _Chat(self)
+        self.usage_path = Path(usage_path)
+        self.usage_path.parent.mkdir(parents=True, exist_ok=True)
+        self.prefer_cloud_above = prefer_cloud_above
+        self._clients: Dict[str, Any] = {}
+        self._failures: Dict[str, int] = {}
+        self._benched_until: Dict[str, float] = {}
+        self._usage: Dict[str, Any] = self._load_usage()
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Provider availability
+    # ------------------------------------------------------------------
+    def available_providers(self) -> List[str]:
+        out = []
+        for name, cfg in PROVIDERS.items():
+            env = cfg.get('env')
+            if env and not os.getenv(env):
+                continue
+            if self._is_benched(name):
+                continue
+            out.append(name)
+        return out or ['ollama']   # ollama is always worth trying
+
+    def _is_benched(self, name: str) -> bool:
+        until = self._benched_until.get(name, 0)
+        if until and time.time() < until:
+            return True
+        if until and time.time() >= until:
+            self._benched_until.pop(name, None)
+            self._failures[name] = 0
+        return False
+
+    def _bench(self, name: str):
+        self._benched_until[name] = time.time() + CIRCUIT_COOLDOWN_SEC
+        self._failures[name] = 0
+
+    def _record_failure(self, name: str):
+        with self._lock:
+            self._failures[name] = self._failures.get(name, 0) + 1
+            if self._failures[name] >= CIRCUIT_THRESHOLD:
+                self._bench(name)
+
+    def _record_success(self, name: str):
+        with self._lock:
+            self._failures[name] = 0
+
+    def _client_for(self, name: str):
+        if name not in self._clients:
+            cfg = PROVIDERS[name]
+            if OpenAI is None:
+                raise RuntimeError("openai package not installed (pip install openai)")
+            # Only 'ollama' carries a literal api_key; every cloud provider
+            # takes its key from the env var named in cfg['env'].
+            # (Before v8.6 this raised KeyError the moment any cloud key
+            # existed — the bug was invisible while Buddy ran Ollama-only.)
+            key = cfg.get('api_key') or os.getenv(cfg.get('env') or '', '')
+            if not key:
+                raise RuntimeError(
+                    f"{name}: no API key ({cfg.get('env')} not set)")
+            self._clients[name] = OpenAI(
+                base_url=cfg['base_url'], api_key=key,
+                timeout=cfg['timeout'],
+            )
+        return self._clients[name]
+
+    # ------------------------------------------------------------------
+    # Routing
+    # ------------------------------------------------------------------
+    def _route_order(self, model_hint: Optional[str], complexity: int,
+                     tier: Optional[str]) -> List[str]:
+        avail = self.available_providers()
+        local = [p for p in avail if PROVIDERS[p]['tier'] == 'local']
+        cloud = [p for p in avail if PROVIDERS[p]['tier'] == 'cloud']
+
+        # Explicit model hint that names a cloud provider's model → honor it
+        if model_hint:
+            for pname, cfg in PROVIDERS.items():
+                if cfg.get('env') and model_hint == cfg['model'] and pname in avail:
+                    return [pname] + [p for p in avail if p != pname]
+
+        want_cloud_first = (
+            tier == 'cloud'
+            or (tier != 'local' and complexity > self.prefer_cloud_above)
+        )
+        if tier == 'best':
+            # best = strongest brain first, regardless of cost
+            cloud.sort(key=lambda p: -PROVIDERS[p].get('power', 0))
+            return cloud + local
+
+        primary = cloud + local if want_cloud_first else local + cloud
+        return primary + [p for p in avail if p not in primary]
+
+    def complete(self, model: Optional[str], messages: List[Dict],
+                 temperature: float, max_tokens: int,
+                 tier: Optional[str] = None) -> ChatResponse:
+        messages = messages or [{'role': 'user', 'content': ''}]
+        complexity = score_complexity(messages, max_tokens)
+        order = self._route_order(model, complexity, tier)
+
+        errors = []
+        for pname in order:
+            cfg = PROVIDERS[pname]
+            # big model when the task earns it (complexity) or the caller
+            # explicitly asked for cloud/best; fast model otherwise
+            want_big = complexity > self.prefer_cloud_above or tier in ('cloud', 'best')
+            target_model = model if (pname == 'ollama' and model and ':' in model) else (
+                cfg['model'] if want_big else cfg['fast_model']
+            )
+            try:
+                client = self._client_for(pname)
+                t0 = time.time()
+                # reasoning models spend tokens thinking BEFORE the answer —
+                # a tight max_tokens returns thought-only (empty) completions
+                req_tokens = max(max_tokens, 2000) if cfg.get('reasoning') else max_tokens
+                # never let the global ROUTER_TIMEOUT starve a slow big brain
+                call_timeout = max(float(os.getenv('ROUTER_TIMEOUT', '300')),
+                                   float(cfg.get('timeout', 300)))
+                resp = client.chat.completions.create(
+                    model=target_model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=req_tokens,
+                    timeout=call_timeout,
+                )
+                content = _extract_content(resp)
+                dt = time.time() - t0
+                if not content.strip():
+                    raise RuntimeError('empty completion (no content, no reasoning)')
+
+                ptoks = estimate_tokens(' '.join(str(m.get('content', '')) for m in messages))
+                ctoks = estimate_tokens(content)
+                cost = (ptoks * cfg['cost_in'] + ctoks * cfg['cost_out']) / 1_000_000
+
+                self._record_success(pname)
+                self._log_usage(pname, target_model, ptoks, ctoks, cost, dt, ok=True)
+                return ChatResponse(content, target_model, pname, ptoks, ctoks, cost)
+
+            except Exception as e:
+                errors.append(f'{pname}: {str(e)[:160]}')
+                self._record_failure(pname)
+                self._log_usage(pname, target_model, 0, 0, 0.0, 0.0, ok=False,
+                                error=str(e)[:200])
+                continue
+
+        raise RuntimeError(
+            'All providers failed:\n  ' + '\n  '.join(errors)
+        )
+
+    # ------------------------------------------------------------------
+    # Usage accounting
+    # ------------------------------------------------------------------
+    def _load_usage(self) -> Dict[str, Any]:
+        try:
+            return json.loads(self.usage_path.read_text(encoding='utf-8'))
+        except Exception:
+            return {'calls': [], 'totals': {'calls': 0, 'cost_usd': 0.0,
+                                            'prompt_tokens': 0, 'completion_tokens': 0}}
+
+    def _log_usage(self, provider: str, model: str, ptoks: int, ctoks: int,
+                   cost: float, seconds: float, ok: bool, error: str = ''):
+        with self._lock:
+            entry = {
+                'ts': datetime.now().isoformat(timespec='seconds'),
+                'provider': provider, 'model': model,
+                'prompt_tokens': ptoks, 'completion_tokens': ctoks,
+                'cost_usd': round(cost, 6), 'seconds': round(seconds, 2),
+                'ok': ok, 'error': error,
+            }
+            self._usage.setdefault('calls', []).append(entry)
+            # keep last 2000 calls so the file never grows unbounded
+            self._usage['calls'] = self._usage['calls'][-2000:]
+            totals = self._usage.setdefault('totals', {})
+            totals['calls'] = totals.get('calls', 0) + 1
+            totals['cost_usd'] = round(totals.get('cost_usd', 0.0) + cost, 6)
+            totals['prompt_tokens'] = totals.get('prompt_tokens', 0) + ptoks
+            totals['completion_tokens'] = totals.get('completion_tokens', 0) + ctoks
+            try:
+                self.usage_path.write_text(
+                    json.dumps(self._usage, indent=2), encoding='utf-8')
+            except Exception:
+                pass
+
+    def usage_report(self) -> Dict[str, Any]:
+        u = self._usage
+        by_provider: Dict[str, Dict[str, float]] = {}
+        for c in u.get('calls', []):
+            p = by_provider.setdefault(c['provider'], {'calls': 0, 'cost_usd': 0.0})
+            p['calls'] += 1
+            p['cost_usd'] += c.get('cost_usd', 0.0)
+        for p in by_provider.values():
+            p['cost_usd'] = round(p['cost_usd'], 4)
+        return {
+            'providers_online': self.available_providers(),
+            'totals': u.get('totals', {}),
+            'by_provider': by_provider,
+        }
+
+    # ------------------------------------------------------------------
+    # Health check — cheap ping of each configured provider
+    # ------------------------------------------------------------------
+    def health_check(self) -> Dict[str, str]:
+        status = {}
+        for name in list(PROVIDERS.keys()):
+            cfg = PROVIDERS[name]
+            if cfg.get('env') and not os.getenv(cfg['env']):
+                status[name] = 'no API key'
+                continue
+            try:
+                client = self._client_for(name)
+                t0 = time.time()
+                resp = client.chat.completions.create(
+                    model=cfg['fast_model'],
+                    messages=[{'role': 'user', 'content': 'ping'}],
+                    # reasoning models need room to think before they can speak
+                    max_tokens=1200 if cfg.get('reasoning') else 5,
+                )
+                content = _extract_content(resp).strip()
+                dt = time.time() - t0
+                status[name] = f"online {dt:.1f}s ({content[:20]!r})"
+                self._record_success(name)
+            except Exception as e:
+                status[name] = f'down ({str(e)[:60]})'
+                self._record_failure(name)
+        return status
+
+
+# ---------------------------------------------------------------------------
+# CLI smoke test:  python core/hybrid_router.py
+# ---------------------------------------------------------------------------
+if __name__ == '__main__':
+    r = HybridRouter()
+    print('Providers online:', r.available_providers())
+    print('Health:', json.dumps(r.health_check(), indent=2))
+    resp = r.chat.completions.create(
+        model='qwen3-coder:30b',
+        messages=[{'role': 'user', 'content': 'Say "Buddy OS hybrid brain online" and nothing else.'}],
+        max_tokens=30,
+    )
+    print(f"[{resp.provider}/{resp.model}] {resp.choices[0].message.content}")
+    print('Usage:', json.dumps(r.usage_report(), indent=2))

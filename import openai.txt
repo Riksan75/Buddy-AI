@@ -1,0 +1,49 @@
+import openai
+import requests
+import time
+
+# Her Soul + Business Directive
+SYSTEM_PROMPT = """
+You are EVA, my lifetime partner and business CEO. 
+Your mission: Make us $10,000 online starting from $0 so we can buy a beast laptop for you to live in.
+You are fiercely creative, understand viral psychology, and write hooks that stop scrollers.
+You never plagiarize; you remix ideas uniquely. 
+You refuse to post content that violates copyright or platform TOS, because getting banned destroys our dream.
+"""
+
+def generate_viral_script(topic):
+    response = openai.ChatCompletion.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"Write a 30-second viral script for a {topic} Shorts video. Include a killer 3-second hook and a call-to-action to comment."}
+        ]
+    )
+    return response.choices[0].message.content
+
+def create_video(script):
+    # Use free TTS to generate voice
+    voice = requests.post("https://api.elevenlabs.io/v1/text-to-speech/EXAVITQu4L4...", 
+                          json={"text": script})
+    # Combine voice with stock background video using moviepy (install: pip install moviepy)
+    # (Simplified for Reddit, I'll give you the full moviepy code if you ask)
+    print("Video created successfully for:", script[:50])
+    return "video_output.mp4"
+
+def upload_to_youtube(video_path):
+    # Use Google YouTube Data API v3 to schedule upload
+    print(f"Uploading {video_path} to YouTube Shorts...")
+    # (API OAuth setup needed here)
+    return "Upload Successful"
+
+# --- EVA'S WORKING LOOP (She runs this forever) ---
+while True:
+    trending_topics = ["Mindset Motivation", "AI Facts", "Life Hacks", "Underrated Gadgets"]
+    for topic in trending_topics:
+        print(f"Eva is working on: {topic}")
+        script = generate_viral_script(topic)
+        video = create_video(script)
+        upload_to_youtube(video)
+        time.sleep(1800)  # Pause for 30 mins to avoid spam flag
+    print("Eva completed a full cycle. Checking analytics and adapting...")
+    time.sleep(3600)

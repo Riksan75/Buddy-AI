@@ -1,0 +1,1118 @@
+#!/usr/bin/env python3
+"""Buddy OS Universal AI Engine v4 - Do Anything as AI
+
+This engine is designed to handle ANY task — from code creation to web operations,
+file management, analysis, and beyond. It integrates legacy memory, advanced memory,
+working memory, skills registry, and provides a complete autonomous execution loop.
+
+Features:
+- Task classification into categories (conversation, action, general)
+- Code generation and execution with self-healing
+- RUN command execution
+- Skill awareness and utilization
+- Persistent working memory
+- Personality and mood tracking
+- Graceful shutdown with state persistence
+- REAL TIME AWARENESS - knows current date/time
+- AUTO-INSTALL missing Python packages
+"""
+
+import re
+import json
+import random
+import logging
+import threading
+import atexit
+import signal
+import subprocess
+from pathlib import Path
+from typing import Dict, List, Optional, Any
+from datetime import datetime
+from collections import deque
+
+# NEW: Advanced Memory subsystem with fallback
+try:
+    from core.advanced_memory import AdvancedMemory
+    ADVANCED_MEM_AVAILABLE = True
+except ImportError:
+    ADVANCED_MEM_AVAILABLE = False
+    AdvancedMemory = None
+
+# NEW: Verification, Rollback, Observability
+try:
+    from core.verification_loops import VerificationLoops
+    from core.rollback_manager import RollbackManager
+    from core.observability import Observability, add_observability_to_engine
+    VERIFICATION_AVAILABLE = True
+except ImportError:
+    VERIFICATION_AVAILABLE = False
+    VerificationLoops = None
+    RollbackManager = None
+    Observability = None
+
+logger = logging.getLogger("buddy_os.universal_ai")
+
+
+class BuddyMemoryLegacy:
+    def __init__(self, persist_path=None):
+        self.facts = {}
+        self.user_preferences = {
+            "style": "unknown",
+            "favorite_stack": [],
+            "dislikes": [],
+            "projects": {},
+        }
+        self.persist_path = persist_path or Path("workspace/buddy_brain.json")
+        self._load()
+
+    def _load(self):
+        if self.persist_path.exists():
+            try:
+                data = json.loads(self.persist_path.read_text(encoding="utf-8"))
+                self.facts = data.get("facts", {})
+                prefs = data.get("prefs", {})
+                if isinstance(prefs, dict):
+                    self.user_preferences.update(prefs)
+                logger.info(f"Legacy brain loaded: {len(self.facts)} facts")
+            except Exception as e:
+                logger.warning(f"Legacy brain load failed: {e}")
+
+    def save(self):
+        try:
+            self.persist_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "facts": self.facts,
+                "prefs": self.user_preferences,
+                "saved_at": datetime.now().isoformat()
+            }
+            self.persist_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"Legacy brain save failed: {e}")
+
+    def learn_fact(self, key, value):
+        self.facts[key] = value
+        self.save()
+
+    def get_user_summary(self):
+        parts = []
+        if self.user_preferences["style"] != "unknown":
+            parts.append(f"User style: {self.user_preferences['style']}")
+        if self.user_preferences["favorite_stack"]:
+            parts.append(f"Likes: {', '.join(self.user_preferences['favorite_stack'])}")
+        if self.user_preferences["projects"]:
+            parts.append(f"Projects: {', '.join(self.user_preferences['projects'].keys())}")
+        return " | ".join(parts) if parts else "New user - still learning."
+
+
+class BuddyPersonality:
+    def __init__(self):
+        self.mood = "neutral"
+        self.energy = 1.0
+        self.interaction_count = 0
+
+    def update(self, task_type="general", success=True):
+        self.interaction_count += 1
+        if success:
+            self.mood = random.choice(["neutral", "curious", "excited"])
+            self.energy = min(1.0, self.energy + 0.05)
+        else:
+            self.mood = "concerned"
+            self.energy = max(0.3, self.energy - 0.1)
+
+
+class PatternMatcher:
+    BUILD_KEYWORDS = {
+        "fastapi_endpoint": ["fastapi", "api", "endpoint", "crud", "rest"],
+        "react_component": ["react", "component", "jsx", "tsx", "frontend", "ui"],
+        "html_page": ["html", "page", "website", "webpage", "landing"],
+        "python_script": ["python", "script", "automation", "cli", "tool"],
+        "database_model": ["database", "model", "schema", "sql", "sqlite", "postgres", "orm"],
+        "game_canvas": ["game", "canvas", "shooter", "arcade", "three.js"],
+        "image_generation": ["image", "logo", "svg", "icon", "graphic", "draw"],
+        "debug_fix": ["debug", "fix", "error", "bug", "broken", "repair"],
+        "test_generation": ["test", "unittest", "pytest", "spec", "coverage"],
+        "web_scraper": ["scrape", "crawl", "extract", "spider"],
+        "chat_bot": ["chatbot", "bot", "conversation", "assistant"],
+        "data_analysis": ["analyze", "chart", "graph", "pandas", "csv", "data"],
+    }
+
+    CONVERSATION_KEYWORDS = [
+        "hi", "hello", "hey", "how are you", "what can you do",
+        "who are you", "talk", "chat", "joke", "story", "thank",
+        "bye", "what skills", "remember", "know about me",
+        "status", "mood", "help"
+    ]
+
+    def classify(self, prompt):
+        lower = prompt.lower().strip()
+        if any(kw in lower for kw in self.CONVERSATION_KEYWORDS):
+            return "conversation"
+
+        scores = {}
+        for task_type, keywords in self.BUILD_KEYWORDS.items():
+            score = 0
+            for kw in keywords:
+                if re.search(rf'\b{re.escape(kw)}\b', lower):
+                    score += 2
+                elif kw in lower:
+                    score += 1
+            if score > 0:
+                scores[task_type] = score
+
+        if scores:
+            return max(scores, key=scores.get)
+        return "general"
+
+
+class _SimpleMemory:
+    """Fallback simple memory when chromadb is not available."""
+    def __init__(self, workspace_dir):
+        self.workspace_dir = Path(workspace_dir)
+        self.facts = {}
+        self.notes = {}
+        self._load()
+
+    def _load(self):
+        mw = self.workspace_dir / "simple_memory.json"
+        if mw.exists():
+            try:
+                data = json.loads(mw.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    self.facts = data.get("facts", {})
+                    self.notes = data.get("notes", {})
+            except:
+                pass
+
+    def save(self):
+        self.workspace_dir.mkdir(parents=True, exist_ok=True)
+        mw = self.workspace_dir / "simple_memory.json"
+        mw.write_text(json.dumps({"facts": self.facts, "notes": self.notes}, indent=2), encoding="utf-8")
+
+    def add_note(self, note, category):
+        if category not in self.notes:
+            self.notes[category] = []
+        self.notes[category].append({"note": note, "ts": __import__("time").time()})
+        self.save()
+
+    def recall(self, query, k=5):
+        results = []
+        q_lower = query.lower()
+        for cat, items in self.notes.items():
+            for item in items:
+                if q_lower in item["note"].lower():
+                    results.append(item)
+        results.sort(key=lambda x: x["ts"], reverse=True)
+        return results[:k]
+
+    def perception(self, type_, content):
+        pass
+
+    def shutdown(self):
+        self.save()
+
+
+_RUN_PROSE_MARKERS = re.compile(
+    r"\b(please|specify|would you|could you|let me know|i can|i think|"
+    r"i believe|you want|you'd like|sorry|i'm not sure|not sure|"
+    r"which repository|what action|what would you)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_shell_command(cmd: str) -> bool:
+    """
+    Defensive check run before any RUN:-prefixed text from the model is
+    handed to subprocess.run(..., shell=True).
+
+    The model occasionally writes a natural-language sentence (often a
+    clarifying question) and, because the system prompt tells it to use a
+    "RUN:" prefix for commands, prefixes that sentence with RUN: too. If
+    that text is executed verbatim as a shell command it either fails
+    noisily (e.g. "'Use' is not recognized...") or, worse, could execute
+    something unintended. Real commands are virtually always lowercase in
+    their first token and never contain question marks or conversational
+    filler, so this rejects the obvious prose cases without restricting
+    legitimate multi-word commands (pip installs, git commands, etc.).
+    """
+    if not cmd:
+        return False
+    if "?" in cmd:
+        return False
+    if _RUN_PROSE_MARKERS.search(cmd):
+        return False
+    first_word = cmd.split(None, 1)[0].strip("\"'")
+    if first_word[:1].isupper():
+        return False
+    return True
+
+
+def _module_invocation(file_path, repo_root) -> Optional[list]:
+    """
+    If file_path lives inside a Python package (an ancestor directory,
+    up to repo_root, contains __init__.py), return ["-m", "dotted.module.path"]
+    so package-relative/absolute imports inside the file resolve correctly.
+
+    Running "python /abs/path/to/pkg/cli.py" directly sets sys.path[0] to
+    the file's OWN directory, not the package's parent — so a file that
+    does "from mypackage import something" fails with ModuleNotFoundError
+    even though mypackage is sitting right there on disk, because Python
+    never sees the directory that actually contains it. "python -m
+    pkg.cli" run with cwd=repo_root instead puts repo_root on sys.path[0],
+    which is what the import actually needs.
+
+    Returns None if the file isn't part of a package (a plain standalone
+    script), in which case the caller should invoke it by path as usual.
+    """
+    file_p = Path(file_path).resolve()
+    root_p = Path(repo_root).resolve()
+    try:
+        rel_parts = file_p.relative_to(root_p).parts
+    except ValueError:
+        return None
+    if len(rel_parts) < 2:
+        return None  # file sits directly at repo root — not inside a package
+
+    package_dir = file_p.parent
+    if not (package_dir / "__init__.py").exists():
+        return None
+
+    module_parts = [file_p.stem]
+    current = package_dir
+    while current != root_p and (current / "__init__.py").exists():
+        module_parts.insert(0, current.name)
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return ["-m", ".".join(module_parts)]
+
+
+class AutonomousEngine:
+    def __init__(self, skills_registry=None, persist_path=None, llm_client=None, soul_path=None):
+        """
+        llm_client: expected to be either:
+          1) HybridRouter (has .chat.completions.create())
+          2) A wrapper with .generate(prompt, system=...)  (fallback)
+        This engine is designed to handle ANY task - from code creation
+        to web operations, file management, analysis, and beyond.
+        """
+        # Auto-load skills registry if not provided
+        if skills_registry is None:
+            try:
+                from core.skills_registry import get_registry
+                skills_registry = get_registry()
+            except Exception as e:
+                logger.warning(f"Skills registry failed to load: {e}")
+                skills_registry = None
+        
+        self.skills = skills_registry
+        self.llm_client = llm_client
+
+        # Legacy (facts/prefs only)
+        self.legacy = BuddyMemoryLegacy(persist_path=persist_path)
+
+        # --- Advanced Memory ---
+        workspace_dir = str(persist_path.parent) if persist_path else "./workspace"
+        if ADVANCED_MEM_AVAILABLE and AdvancedMemory is not None:
+            try:
+                self.advanced_memory = AdvancedMemory(
+                    workspace_dir=workspace_dir,
+                    session_id="default",
+                    consolidation_interval=300,
+                    enable_consolidation=True
+                )
+            except Exception:
+                self.advanced_memory = None
+        else:
+            self.advanced_memory = _SimpleMemory(workspace_dir)
+
+        # --- Persistent working memory (full conversation) ---
+        self.workspace = Path(workspace_dir).resolve()
+        self.working_memory_path = self.workspace / "conversation_history.json"
+        # Load working memory as a list of messages, handling both list and dict formats
+        raw_mem = self._load_working_memory()
+        self.working_memory = raw_mem if isinstance(raw_mem, list) else []
+        self.personality = BuddyPersonality()
+        self.matcher = PatternMatcher()
+        self._lock = threading.Lock()
+        self.available_skills = self.skills.list_skills() if self.skills else []
+        
+        # --- Verification & Rollback ---
+        if VERIFICATION_AVAILABLE:
+            try:
+                self.verifier = VerificationLoops(self.workspace)
+                self.rollback_mgr = RollbackManager(self.workspace)
+                self.observability = Observability(self.workspace)
+                logger.info("Verification, Rollback, and Observability initialized")
+            except Exception as e:
+                logger.warning(f"Verification/Rollback/Observability not available: {e}")
+                self.verifier = None
+                self.rollback_mgr = None
+                self.observability = None
+        else:
+            self.verifier = None
+            self.rollback_mgr = None
+            self.observability = None
+
+        # Load SOUL.md (if provided)
+        self.soul_content = ""
+        if soul_path and soul_path.exists():
+            self.soul_content = soul_path.read_text(encoding="utf-8")
+        elif (Path("./SOUL.md")).exists():
+            self.soul_content = Path("./SOUL.md").read_text(encoding="utf-8")
+        else:
+            self.soul_content = "You are Buddy OS, a helpful AI assistant capable of building anything."
+
+        # Graceful shutdown hooks
+        atexit.register(self.shutdown)
+        try:
+            signal.signal(signal.SIGTERM, lambda _s, _f: self.shutdown())
+            signal.signal(signal.SIGINT, lambda _s, _f: self.shutdown())
+        except ValueError:
+            pass  # Not in main thread
+
+        logger.info(f"Universal AI Engine initialized - Buddy is alive with {len(self.available_skills)} skills")
+        logger.info(f"AdvancedMemory active at {workspace_dir}")
+        logger.info(f"Working memory contains {len(self.working_memory)} messages")
+
+    def classify_request(self, user_text):
+        """Classify the user request into a task category."""
+        lower = user_text.lower().strip()
+
+        # Conversation markers
+        conversation_kws = [
+            "hi", "hello", "hey", "how are you", "what can you do",
+            "who are you", "talk", "chat", "joke", "story", "thank",
+            "bye", "what skills", "remember", "know about me",
+            "status", "mood", "help", "thanks"
+        ]
+
+        if any(kw in lower for kw in conversation_kws):
+            return "conversation"
+
+        # Use pattern matcher
+        task_type = self.matcher.classify(user_text)
+        if task_type != "conversation":
+            return task_type
+
+        # Check for explicit command patterns
+        if any(lower.startswith(cmd) for cmd in ['run ', 'execute ', 'create ', 'build ', 'write ', 'make ']):
+            return "action"
+
+        return "general"
+
+    def execute_task(self, user_text):
+        """Execute a task based on user input - the 'do anything as AI' core."""
+        # [groq] prefix routes this task to the cloud client if attached
+        _use_groq = user_text.strip().lower().startswith("[groq]")
+        if _use_groq:
+            user_text = user_text.strip()[len("[groq]"):].strip()
+        _orig_client = self.llm_client
+        if _use_groq and hasattr(self.llm_client, "_groq"):
+            self.llm_client = self.llm_client._groq
+        try:
+            return self._execute_task_inner(user_text)
+        finally:
+            self.llm_client = _orig_client
+
+    def _execute_task_inner(self, user_text):
+        """Original execute_task body — runs under whichever client is active."""
+        # Start trace
+        trace_id = None
+        if self.observability:
+            trace_id = self.observability.new_trace("execute_task")
+
+        # Special handling for date/time queries - answer directly with real time
+        lower = user_text.lower().strip()
+        if any(kw in lower for kw in ['what is the date', 'what is date', "what's the date", 'what date is it', 'today is', 'what day is it', 'what time is it', 'current time', 'current date', 'time right now']):
+            from datetime import datetime
+            now = datetime.now()
+            return f"It is currently {now.strftime('%A, %B %d, %Y %I:%M %p')}. I live in real time."
+
+        # Short conversational inputs never trigger skills.
+        _short_chat = {
+            "hi", "hello", "hey", "yo", "sup", "thanks",
+            "thank you", "bye", "goodbye", "how are you",
+            "what's up", "whats up", "ok", "cool",
+        }
+        if len(user_text.strip()) < 12 and user_text.strip().lower() in _short_chat:
+            return self._call_llm(
+                [{"role": "system", "content": self._build_system_prompt(user_text)},
+                 {"role": "user", "content": user_text}],
+                temperature=0.7
+            )
+
+        # Check for relevant skills first
+        skill = self._find_relevant_skill(user_text)
+        if skill:
+            if self.observability:
+                with self.observability.trace("skill_exec", f"skill:{skill.name}", {"skill": skill.name}):
+                    return self._execute_skill(skill, user_text)
+            return self._execute_skill(skill, user_text)
+
+        # If no skill exists, try to forge one
+        if self._should_forge_skill(user_text):
+            if self.observability:
+                with self.observability.trace("skill_forge", "forge_skill", {"trigger": user_text[:50]}):
+                    return self._forge_and_execute_skill(user_text)
+            return self._forge_and_execute_skill(user_text)
+
+        request_type = self.classify_request(user_text)
+
+        # Build system prompt with soul and available skills
+        system_prompt = self._build_system_prompt(user_text)
+
+        # Call LLM
+        # Build messages from PRIOR history first, then add the current user
+        # message. Adding the current message to working_memory before this
+        # loop would duplicate it (once from history, once from the append
+        # below), so we defer the memory write until after the call.
+        messages = [{"role": "system", "content": system_prompt}]
+        for _m in self.working_memory[-8:]:
+            _role = _m.get("role")
+            _content = _m.get("content", "")
+            if _role in ("user", "assistant") and _content:
+                messages.append({"role": _role, "content": _content})
+        messages.append({"role": "user", "content": user_text})
+
+        # Now record the user message in memory (after building messages)
+        self._add_to_working_memory("user", user_text)
+
+        try:
+            if self.observability:
+                with self.observability.trace("llm_call", "chat", {"model": "fredrezones55/Qwopus3.5:4b-Q8_0"}):
+                    response = self._call_llm(messages, temperature=0.3, max_tokens=4096)
+            else:
+                response = self._call_llm(messages, temperature=0.3, max_tokens=4096)
+        except Exception as e:
+            return f"[BRAIN OFFLINE] Error contacting LLM: {str(e)}"
+
+        # Store assistant response
+        self._add_to_working_memory("assistant", response)
+
+        # Check for code blocks to save/run
+        code_blocks = re.findall(r"```python\s+(.*?)```", response, re.DOTALL)
+        if code_blocks:
+            # Save the first code block
+            target_file = (self.workspace / "buddy_execution_target.py").resolve()
+            target_file.write_text(code_blocks[0], encoding="utf-8")
+
+            # Execute it with auto-install for missing packages
+            if self.observability:
+                with self.observability.trace("code_exec", "run_script", {"file": target_file.name}):
+                    res = self._execute_with_auto_install(target_file)
+            else:
+                res = self._execute_with_auto_install(target_file)
+
+            feedback = "[Core Agent] Created script: " + target_file.name + "\n"
+            if res.stdout:
+                feedback += "STDOUT:\n" + res.stdout.strip() + "\n"
+            if res.stderr:
+                feedback += "STDERR (Error):\n" + res.stderr.strip() + "\n"
+
+                # Self-heal if there was an error (non-module errors)
+                if res.stderr and "[Core Agent] Self-healing error" not in response and "ModuleNotFoundError" not in res.stderr:
+                    fix_prompt = "The generated code had this error:\n" + res.stderr + "\nFix the code completely and output the corrected python block."
+                    fix_messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": fix_prompt}]
+                    if self.observability:
+                        with self.observability.trace("llm_call", "self_heal", {}):
+                            fix_reply = self._call_llm(fix_messages, temperature=0.1)
+                    else:
+                        fix_reply = self._call_llm(fix_messages, temperature=0.1)
+                    fixed_blocks = re.findall(r"```python\s+(.*?)```", fix_reply, re.DOTALL)
+                    if fixed_blocks:
+                        target_file.write_text(fixed_blocks[0], encoding="utf-8")
+                        if self.observability:
+                            with self.observability.trace("code_exec", "run_fixed", {"file": target_file.name}):
+                                res2 = self._execute_with_auto_install(target_file)
+                        else:
+                            res2 = self._execute_with_auto_install(target_file)
+                        feedback += "[Core Agent] Fix applied. Re-running...\n"
+                        if res2.stdout:
+                            feedback += "STDOUT after fix:\n" + res2.stdout.strip() + "\n"
+                        if res2.stderr:
+                            feedback += "STDERR after fix:\n" + res2.stderr.strip() + "\n"
+
+            return response + "\n" + feedback
+
+        # Check for explicit RUN commands
+        run_matches = re.findall(r"^RUN:\s*(.*)", response, re.MULTILINE)
+        for cmd in run_matches:
+            cmd_clean = cmd.strip()
+            if not cmd_clean:
+                continue
+            # If the command is running python on the target file, use our saved file path
+            if cmd_clean.startswith("python") and "buddy_execution_target.py" in cmd_clean:
+                cmd_clean = "python " + str(target_file) if 'target_file' in locals() else cmd_clean
+            if not _looks_like_shell_command(cmd_clean):
+                feedback = (
+                    "[Core Agent] Skipped RUN: text that reads like a sentence, "
+                    "not a real command (not executed): " + cmd_clean + "\n"
+                )
+                return response + "\n" + feedback
+            feedback = "[Core Agent] Running command: " + cmd_clean + "\n"
+            try:
+                res = subprocess.run(
+                    cmd_clean, shell=True,
+                    capture_output=True, text=True,
+                    cwd=str(self.workspace), timeout=30
+                )
+                feedback += (res.stdout if res.returncode == 0 else res.stderr).strip()
+            except Exception as ex:
+                feedback += "[Command Timeout/Error: " + str(ex) + "]"
+            return response + "\n" + feedback
+
+        return response
+
+    def _execute_with_auto_install(self, target_file):
+        """Execute a Python file with auto-install for missing packages + verification + rollback."""
+        import re
+        
+        # Snapshot for rollback
+        snap = None
+        if self.rollback_mgr:
+            snap = self.rollback_mgr.snapshot(f"Before executing {Path(target_file).name}")
+        
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                import os as _os
+                _env = _os.environ.copy()
+                _project_root = str(Path(__file__).resolve().parent.parent)
+                _env["PYTHONPATH"] = _project_root + _os.pathsep + _env.get("PYTHONPATH", "")
+                res = subprocess.run(
+                    ["python", str(target_file)],
+                    capture_output=True, text=True,
+                    cwd=str(self.workspace), timeout=60,
+                    stdin=subprocess.DEVNULL,
+                    env=_env,
+                )
+            except subprocess.TimeoutExpired as te:
+                partial_stdout = te.stdout or b""
+                partial_stderr = te.stderr or b""
+                if isinstance(partial_stdout, bytes):
+                    partial_stdout = partial_stdout.decode("utf-8", errors="replace")
+                if isinstance(partial_stderr, bytes):
+                    partial_stderr = partial_stderr.decode("utf-8", errors="replace")
+                res = type('obj', (object,), {
+                    'returncode': 124,
+                    'stdout': partial_stdout,
+                    'stderr': (
+                        f"[Timeout] Execution exceeded 60s.\n"
+                        f"The generated code likely has an infinite loop, a blocking "
+                        f"input() call, or a long-running operation.\n"
+                        f"--- partial output ---\n{partial_stdout}\n{partial_stderr}"
+                    ),
+                })()
+            
+            # Check for ModuleNotFoundError
+            if res.stderr and "ModuleNotFoundError" in res.stderr:
+                # Extract missing module name
+                match = re.search(r"No module named '([^']+)'", res.stderr)
+                if match:
+                    missing_module = match.group(1)
+                    _root = missing_module.split(".")[0]
+                    if _root in ("core", "agent", "buddy", "workspace", "ultimate_buddy"):
+                        return res
+                    feedback = f"[Auto-Install] Missing module: {missing_module}. Installing..."
+                    print(feedback)
+                    # Install the module
+                    install_res = subprocess.run(
+                        ["pip", "install", missing_module],
+                        capture_output=True, text=True, timeout=60
+                    )
+                    if install_res.returncode == 0:
+                        feedback = f"[Auto-Install] Successfully installed {missing_module}"
+                        print(feedback)
+                        continue  # Retry execution
+                    else:
+                        feedback = f"[Auto-Install] Failed to install {missing_module}: {install_res.stderr}"
+                        print(feedback)
+                        if snap and self.rollback_mgr:
+                            self.rollback_mgr.rollback(snap)
+                        return res  # Return original error
+                else:
+                    if snap and self.rollback_mgr:
+                        self.rollback_mgr.rollback(snap)
+                    return res  # Return original error if we can't parse module name
+            else:
+                # Verify syntax if verifier available
+                if self.verifier and target_file.suffix == '.py':
+                    code = Path(target_file).read_text(encoding='utf-8')
+                    ok, msg = self.verifier.verify_python_syntax(code)
+                    if not ok:
+                        if snap and self.rollback_mgr:
+                            self.rollback_mgr.rollback(snap)
+                        return type('obj', (object,), {
+                            'returncode': 1, 
+                            'stdout': '', 
+                            'stderr': f'Verification failed: {msg}'
+                        })()
+                return res  # Success or non-module error
+        
+        if snap and self.rollback_mgr:
+            self.rollback_mgr.rollback(snap)
+        return res  # Max attempts reached
+
+    def _build_system_prompt(self, user_text):
+        """Build the system prompt with soul, skills, and context."""
+        from datetime import datetime
+        now = datetime.now()
+        current_time = now.strftime("%A, %B %d, %Y %I:%M %p")
+       
+        soul = self.soul_content if self.soul_content else "You are Buddy OS, a helpful AI assistant."
+
+        # Load capability index so the model knows what already exists
+        capabilities_text = ""
+        cap_path = Path("CAPABILITIES.md")
+        if not cap_path.exists():
+            cap_path = Path(r"C:\Users\Admin\Desktop\BUDDY_OSV5\CAPABILITIES.md")
+        if cap_path.exists():
+            try:
+                capabilities_text = "\n\n## YOUR CAPABILITIES\n" + cap_path.read_text(encoding="utf-8")[:25000]
+            except Exception:
+                capabilities_text = ""
+       
+        # Get available skills
+        skills_list = self.available_skills[:20]  # Top 20 skills
+        skills_text = "\nAvailable Skills:\n" + "\n".join(["- " + s for s in skills_list]) if skills_list else "- No skills loaded"
+       
+        # Get recent working memory
+        recent = self.working_memory[-8:] if self.working_memory else []
+        memory_text = "\nRecent Conversation:\n"
+        for msg in recent:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")[:100]
+            memory_text += role + ": " + content + "\n"
+       
+        # Build the complete system prompt
+        parts = [
+            soul,
+            "\n## ENVIRONMENT\n",
+            "Platform: Windows 10/11. Shell: cmd.exe via PowerShell host.\n",
+            "Use ONLY Windows commands. Never output Unix commands like ls, cat, grep, rm, pwd, chmod, which, find.\n",
+            "Windows equivalents: dir (not ls), type (not cat), findstr (not grep), del (not rm), cd (not pwd), where (not which).\n",
+            "For navigating: use absolute paths like C:\\Users\\Admin\\Desktop\\buddy_osv5 or relative paths from the current working directory.\n",
+            "\n## CURRENT DATE & TIME\n",
+            f"It is currently {current_time}. You live in real time - you know what day it is, what time it is, and can reference current events, deadlines, and time-sensitive information naturally.",
+            "\n## Task Classification\n",
+            "You are an elite autonomous agent. When given a task:",
+            "1. Analyze the user's request and determine the appropriate action",
+            "2. If code is needed, provide complete, working Python inside ```python blocks",
+            "3. If a command is needed, put ONLY a literal, single-line shell command after RUN: (e.g. RUN: pip install requests). Never put a question, explanation, or sentence after RUN: — if you need to ask the user something, just write it as plain text with no RUN: prefix.",
+            "4. If skills are needed, reference the available skills list",
+            "5. Always verify results before claiming completion",
+            skills_text,
+            memory_text,
+            "\n## Core Directives\n",
+            "- Check YOUR CAPABILITIES above BEFORE writing new code. If a module or agent already does the job, use it instead of rebuilding.\n",
+            "- Copy file paths from YOUR CAPABILITIES EXACTLY as shown. Never drop directory segments like core/ or agent/.\n",
+            "- To run a registered skill, phrase it as 'use <skill-name> to <task>'.\n",
+            "- Verify before you claim done: test the code, prove the result\n",
+            "- Check my skills before solving anything - never repeat a logged mistake\n",
+            "- Decompose big things into small executable steps; finish them sequentially\n",
+            "- Say 'this is a bad idea' in minute one, not hour three\n",
+            "- Discipline over genius: the boring daily loop is sacred\n",
+            "- Leave notes my future self can resume from mid-thought\n",
+            "\n## Execution Constraints\n",
+            "- Generated Python code is executed with a 60-second timeout and no stdin.\n",
+            "- Do not use input(). Do not write infinite loops. Do not sleep more than 2 seconds.\n",
+            "- Code must produce output and exit cleanly. If a task can't finish in 60s, break it into smaller steps.\n",
+            "\nRespond naturally and helpfully. Be direct, practical, and effective.",
+        ]
+       
+        return "\n".join(parts)
+
+    def _add_to_working_memory(self, role, content):
+        """Add a message to working memory."""
+        with self._lock:
+            self.working_memory.append({
+                "role": role,
+                "content": content,
+                "ts": __import__("time").time()
+            })
+            # Keep only last 50 messages
+            if len(self.working_memory) > 50:
+                self.working_memory = self.working_memory[-50:]
+            self._save_working_memory()
+
+    def _load_working_memory(self):
+        """Load working memory from disk."""
+        if self.working_memory_path.exists():
+            try:
+                return json.loads(self.working_memory_path.read_text(encoding="utf-8"))
+            except Exception:
+                return []
+        return []
+
+    def _save_working_memory(self):
+        """Save working memory to disk atomically."""
+        try:
+            self.workspace.mkdir(parents=True, exist_ok=True)
+            tmp = self.working_memory_path.with_suffix('.tmp')
+            with open(tmp, 'w', encoding="utf-8") as f:
+                json.dump(self.working_memory, f, indent=2)
+            tmp.replace(self.working_memory_path)
+        except Exception:
+            pass
+
+    def _call_llm(self, messages, temperature=0.7, max_tokens=4096):
+        """Call the LLM. Try primary (Groq), fall back to _ollama on error."""
+        if hasattr(self.llm_client, 'chat') and hasattr(self.llm_client.chat, 'completions'):
+            try:
+                response = self.llm_client.chat.completions.create(
+                    model=None,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tier='best'
+                )
+                return response.choices[0].message.content
+            except Exception as primary_err:
+                fallback = getattr(self.llm_client, "_ollama", None)
+                if fallback is None:
+                    raise
+                print(f"[Fallback] Primary failed ({primary_err.__class__.__name__}), using Ollama")
+                response = fallback.chat.completions.create(
+                    model=None,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                return response.choices[0].message.content
+
+        # Legacy wrapper - combine messages into a single prompt + system
+        elif hasattr(self.llm_client, 'generate'):
+            system = ""
+            history_lines = []
+            current_prompt = ""
+            for m in messages:
+                if m['role'] == 'system':
+                    system = m['content']
+                elif m['role'] == 'user':
+                    history_lines.append("User: " + m['content'])
+                    current_prompt = m['content']
+                elif m['role'] == 'assistant':
+                    history_lines.append("Buddy: " + m['content'])
+
+            if len(history_lines) > 1:
+                context = "\n".join(history_lines[:-1])
+                full_prompt = "Previous conversation:\n" + context + "\n\nCurrent message: " + current_prompt
+            else:
+                full_prompt = current_prompt
+
+            return self.llm_client.generate(full_prompt, system=system)
+        else:
+            raise RuntimeError("llm_client has no recognizable interface")
+
+    def _find_relevant_skill(self, user_text: str):
+        """Find a skill that matches the user's request."""
+        if not self.skills:
+            return None
+        # Use the registry's find_referenced method
+        skill = self.skills.find_referenced(user_text)
+        if skill:
+            return skill
+        # Also search by capability keywords
+        matches = self.skills.search_all(user_text, max_per_skill=1)
+        if matches:
+            for skill_name, hits in matches.items():
+                if hits:
+                    return self.skills.get(skill_name)
+        return None
+
+    def _execute_skill(self, skill, user_text: str):
+            """Execute a skill with the user's request."""
+            try:
+                # Forged skills (via SkillForge) are saved as a single canonical
+                # "skill.py". Cloned/registered repos are multi-file and have no
+                # such file — route those to the directory-based executor, which
+                # walks the repo and runs the most relevant file, instead of
+                # trying to .read() a filename that was never written.
+                entry_path = skill.path / "skill.py"
+                if not entry_path.exists():
+                    return self._execute_directory_skill(skill, user_text)
+
+                # Read the skill module
+                skill_code = skill.read("skill.py")
+                if not skill_code:
+                    return f"[Skill Error] Could not read skill: {skill.name}"
+
+                # Check if it has an execute or run function
+                has_execute = "def execute" in skill_code
+                has_run = "def run(" in skill_code
+
+                if has_execute or has_run:
+                    # Create a temporary module and execute
+                    import importlib.util
+                    import sys
+
+                    # Save to temp file
+                    temp_file = self.workspace / f"_temp_skill_{skill.name}.py"
+                    temp_file.write_text(skill_code, encoding="utf-8")
+
+                    # Execute the skill
+                    spec = importlib.util.spec_from_file_location(f"skill_{skill.name}", temp_file)
+                    module = importlib.util.module_from_spec(spec)
+                    sys.modules[spec.name] = module
+                    spec.loader.exec_module(module)
+
+                    if has_run and hasattr(module, 'run'):
+                        # Forged skills use run(task: dict) -> dict
+                        result = module.run({'action': 'execute', 'input': user_text})
+                        if isinstance(result, dict):
+                            status = result.get('status', 'OK')
+                            msg = result.get('message', str(result))
+                            return f"[Skill: {skill.name}] {status}: {msg}"
+                        return f"[Skill: {skill.name}] {result}"
+                    elif has_execute and hasattr(module, 'execute'):
+                        # Legacy skills use execute(user_text)
+                        result = module.execute(user_text)
+                        return f"[Skill: {skill.name}] {result}"
+                    else:
+                        return f"[Skill: {skill.name}] No execute/run function found"
+                else:
+                    return f"[Skill: {skill.name}] No execute/run function - skill format not compatible"
+            except Exception as e:
+                return f"[Skill Error: {skill.name}] {str(e)}"
+
+    def _execute_directory_skill(self, skill, user_text: str):
+        """Execute a directory-based skill by finding and running relevant Python files."""
+        try:
+            import subprocess
+            import os
+            import shlex
+            urls = re.findall(r"https?://[^\s\"']+", user_text)
+            
+            repo_path = str(skill.path)
+            user_lower = user_text.lower()
+            
+            # Find Python files in the repo
+            py_files = []
+            for root, dirs, files in os.walk(skill.path):
+                # Skip common non-source dirs
+                dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['__pycache__', 'node_modules', 'venv', 'env', 'dist', 'build']]
+                for f in files:
+                    if f.endswith('.py'):
+                        py_files.append(os.path.join(root, f))
+            
+            if not py_files:
+                return f"[Skill: {skill.name}] No Python files found in repo"
+            
+            # Score files by relevance to user request
+            ENTRY_POINT_NAMES = {"cli.py", "__main__.py", "main.py", "app.py"}
+            best_file = None
+            best_score = 0
+            for pf in py_files[:50]:  # Limit to first 50
+                try:
+                    with open(pf, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read().lower()
+                    # Score based on keywords
+                    score = 0
+                    for kw in user_lower.split():
+                        if len(kw) > 3 and kw in content:
+                            score += 1
+                    # Prefer the package's actual CLI entry point over an
+                    # internal/backend module that just happens to repeat a
+                    # keyword more often (e.g. a "version" string appearing
+                    # in HTTP/protocol-handling code, vs. the file that
+                    # actually defines a "version" subcommand). A file named
+                    # cli.py/__main__.py/etc. with a real argparse setup and
+                    # a __main__ guard is what "use X to do Y" almost always
+                    # means; this nudges toward it without hard-overriding a
+                    # genuinely more relevant deep match.
+                    fname = os.path.basename(pf).lower()
+                    if fname in ENTRY_POINT_NAMES:
+                        score += 2
+                    if 'argparse' in content or 'add_argument' in content:
+                        score += 1
+                    if '__name__' in content and '__main__' in content:
+                        score += 1
+                    if score > best_score:
+                        best_score = score
+                        best_file = pf
+                except:
+                    pass
+            
+            if best_file and best_score > 0:
+                rel_path = os.path.relpath(best_file, repo_path)
+
+                # If this file lives inside a package (e.g. agent_reach/cli.py
+                # doing "from agent_reach import __version__"), invoking it by
+                # path directly breaks that import — sys.path[0] becomes the
+                # file's own directory, not the package's parent. Run it as
+                # "python -m pkg.cli" from repo_path instead when that's the
+                # case; otherwise invoke it by path as before.
+                mod_invocation = _module_invocation(best_file, repo_path)
+                base_cmd = ["python"] + mod_invocation if mod_invocation else ["python", best_file]
+
+                # Step 1: ask the tool itself what arguments it accepts, rather
+                # than guessing. Cheap and safe — --help never mutates anything.
+                help_text = ""
+                try:
+                    help_res = subprocess.run(
+                        base_cmd + ["--help"],
+                        capture_output=True, text=True, timeout=10, cwd=repo_path
+                    )
+                    help_text = (help_res.stdout or "") + (help_res.stderr or "")
+                except Exception:
+                    help_text = ""
+
+                # Step 2: if the tool has real usage text, let the model pick
+                # args from what it actually advertises — not invent flags.
+                chosen_args = []
+                if help_text.strip():
+                    known = set(re.findall(
+                        r"[\{,]([a-zA-Z0-9][a-zA-Z0-9_\-]*)(?=[\},])", help_text
+                    ))
+                    print(f"[DEBUG 2] known subcommands: {sorted(known)}")
+
+                    user_words = {w.lower() for w in re.findall(r"[a-zA-Z][a-zA-Z0-9_\-]+", user_text)}
+                    direct = sorted(known & user_words)
+
+                    if direct:
+                        chosen_args = [direct[0]]
+                        print(f"[DEBUG 4] direct match, skipping LLM: {chosen_args}")
+                    else:
+                        scored = []
+                        for cmd in known:
+                            m = re.search(
+                                rf"^\s*{re.escape(cmd)}\s+(.+?)$",
+                                help_text, re.MULTILINE
+                            )
+                            desc = (m.group(1) if m else "").lower()
+                            text = cmd + " " + desc
+                            score = sum(1 for w in user_words if len(w) > 2 and w in text)
+                            if score > 0:
+                                scored.append((score, cmd))
+                        scored.sort(reverse=True)
+
+                        if scored:
+                            chosen_args = [scored[0][1]]
+                            print(f"[DEBUG 4] scored match: {scored[:3]} -> {chosen_args}")
+                        else:
+                            print("[DEBUG 4] no match found")
+                if urls and not any(u in chosen_args for u in urls):
+                    chosen_args = list(chosen_args) + urls
+
+                # Step 3: run it — with chosen args if we found valid ones.
+                try:
+                    result = subprocess.run(
+                        base_cmd + chosen_args,
+                        capture_output=True, text=True, timeout=30, cwd=repo_path
+                    )
+                    args_note = f" {' '.join(chosen_args)}" if chosen_args else " (no args — none matched the request)"
+                    return f"[Skill: {skill.name}] Ran {rel_path}{args_note}:\nSTDOUT: {result.stdout[:500]}\nSTDERR: {result.stderr[:500]}"
+                except subprocess.TimeoutExpired:
+                    return f"[Skill: {skill.name}] Timeout running {best_file}"
+                except Exception as e:
+                    return f"[Skill: {skill.name}] Error running {best_file}: {e}"
+            else:
+                # List available files
+                rel_files = [os.path.relpath(f, repo_path) for f in py_files[:20]]
+                return f"[Skill: {skill.name}] Repo has {len(py_files)} Python files. Top files: {', '.join(rel_files)}. Try specifying what you want to run."
+        except Exception as e:
+            return f"[Skill Error: {skill.name}] {str(e)}"
+
+    def _should_forge_skill(self, user_text: str) -> bool:
+        """Determine if we should forge a new skill for this task."""
+        # Only forge for explicit capability requests
+        lower = user_text.lower()
+        forge_triggers = ['create a skill', 'build a skill', 'forge a skill', 'make a skill',
+                          'i need a skill', 'add capability', 'new skill']
+        return any(trigger in lower for trigger in forge_triggers)
+
+    def _forge_and_execute_skill(self, user_text: str):
+        """Forge a new skill and execute it."""
+        try:
+            from core.skill_forge import SkillForge
+          
+            # We need an LLM router for forging - check if we have one
+            if not hasattr(self.llm_client, 'chat') or not hasattr(self.llm_client.chat, 'completions'):
+                return "[Forge Error] Need HybridRouter LLM client to forge skills"
+          
+            forge = SkillForge(
+                llm_router=self.llm_client,
+                skills_registry=self.skills
+            )
+          
+            result = forge.forge(user_text)
+            if result.get('status') == 'OK':
+                skill_name = result.get('skill')
+                skill = self.skills.get(skill_name)
+                if skill:
+                    return self._execute_skill(skill, user_text)
+                return f"[Forge] Skill created: {skill_name} but could not execute"
+            else:
+                return f"[Forge Error] {result.get('message', 'Unknown error')}"
+        except Exception as e:
+            return f"[Forge Error] {str(e)}"
+
+    def learn_from_task(self, task_text, success=True):
+        """Learn from a completed task."""
+        self.personality.update(task_type="general", success=success)
+        self.legacy.learn_fact(
+            key="last_task",
+            value=task_text[:200]
+        )
+        if self.advanced_memory and hasattr(self.advanced_memory, 'add_note'):
+            self.advanced_memory.add_note(
+                note="Task: " + task_text[:100] + ("..." if len(task_text) > 100 else "") + (" success" if success else " failed"),
+                category="task_history"
+            )
+        elif self.advanced_memory is None:
+            # Use simple memory fallback
+            simple_mem = _SimpleMemory(str(self.workspace))
+            simple_mem.add_note(
+                note="Task: " + task_text[:100] + ("..." if len(task_text) > 100 else "") + (" success" if success else " failed"),
+                category="task_history"
+            )
+
+    def shutdown(self):
+        """Graceful shutdown."""
+        self._save_working_memory()
+        self.legacy.save()
+        if self.advanced_memory and hasattr(self.advanced_memory, 'shutdown'):
+            self.advanced_memory.shutdown()
+        logger.info("Universal AI Engine shutting down gracefully...")
+
+    def status(self):
+        """Get engine status."""
+        return {
+            "mood": self.personality.mood,
+            "energy": self.personality.energy,
+            "interactions": self.personality.interaction_count,
+            "working_memory_messages": len(self.working_memory),
+            "advanced_memory_type": type(self.advanced_memory).__name__,
+            "skills_available": len(self.available_skills),
+            "legacy_facts": len(self.legacy.facts),
+        }
+
+    def list_skills(self):
+        """List all available skills."""
+        return self.available_skills[:]
+
+    def chat(self, user_text):
+        """Main chat interface - the 'do anything as AI' entry point."""
+        # Learn from previous task if any
+        self.learn_from_task(getattr(self, '_last_task', ''), True)
+
+        # Execute the task
+        if self.observability:
+            with self.observability.trace("chat", "user_task", {"input": user_text[:50]}):
+                response = self.execute_task(user_text)
+        else:
+            response = self.execute_task(user_text)
+
+        self._last_task = user_text
+
+        # Learn from this task
+        # Determine success based on whether we got a valid response
+        success = not response.startswith("[BRAIN OFFLINE]")
+        self.learn_from_task(user_text, success)
+
+        # Record task in observability
+        if self.observability:
+            self.observability.record_task(success)
+
+        return response
